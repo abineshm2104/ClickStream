@@ -1,3 +1,5 @@
+# Updated app1.py with pipeline fitting fix
+
 # Import necessary libraries
 import pandas as pd
 import numpy as np
@@ -6,32 +8,35 @@ import seaborn as sns
 import mlflow
 import mlflow.sklearn
 import pickle
+import logging
 from sklearn.model_selection import train_test_split, GridSearchCV
 from sklearn.preprocessing import StandardScaler, OneHotEncoder, MinMaxScaler
 from sklearn.compose import ColumnTransformer
 from sklearn.pipeline import Pipeline
 from sklearn.impute import SimpleImputer
 from sklearn.linear_model import LogisticRegression, LinearRegression, Ridge, Lasso
-from sklearn.ensemble import RandomForestClassifier, GradientBoostingRegressor
+from sklearn.ensemble import RandomForestClassifier, GradientBoostingRegressor, RandomForestRegressor
 from sklearn.cluster import KMeans, DBSCAN, AgglomerativeClustering
-from sklearn.metrics import (accuracy_score, precision_score, recall_score, f1_score, roc_auc_score,
-                             mean_absolute_error, mean_squared_error, r2_score, silhouette_score,
-                             davies_bouldin_score)
+from sklearn.metrics import (
+    accuracy_score, precision_score, recall_score, f1_score, roc_auc_score,
+    mean_absolute_error, mean_squared_error, r2_score, silhouette_score, davies_bouldin_score
+)
 from imblearn.over_sampling import SMOTE
-from xgboost import XGBClassifier
-import streamlit as st
-from sklearn.base import BaseEstimator, TransformerMixin
 from imblearn.under_sampling import RandomUnderSampler
-from sklearn.metrics import davies_bouldin_score
-from scipy import sparse
-from sklearn.decomposition import TruncatedSVD
-from sklearn.metrics import silhouette_score
+from xgboost import XGBClassifier
+from sklearn.tree import DecisionTreeClassifier
+from sklearn.neural_network import MLPClassifier
+from sklearn.base import BaseEstimator, TransformerMixin
+import streamlit as st
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
 
 # Data Preprocessing
 @st.cache_data
 def load_data():
-    train = pd.read_csv( r"C:\Users\abims\Downloads\train_data (1).csv")
-    test = pd.read_csv(r"C:\Users\abims\Downloads\test_data (1).csv")
+    train = pd.read_csv( r"C:\Users\abims\Downloads\train_data_con.csv")
+    test = pd.read_csv(r"C:\Users\abims\Downloads\test_data _con.csv")
     return train, test
 
 train_df, test_df = load_data()
@@ -40,14 +45,12 @@ train_df, test_df = load_data()
 def create_targets(df):
     if 'order' not in df.columns:
         raise KeyError("The 'order' column is missing from the DataFrame. Please verify the input data.")
-   
     df['converted'] = df['order'].apply(lambda x: 1 if 'checkout' in str(x).lower() else 0)
     df['revenue'] = df.groupby('session_id')['price'].transform('sum')
     return df
 
 train_df = create_targets(train_df)
 test_df = create_targets(test_df)
-    
 
 # Aggregate session data
 def aggregate_session_data(df):
@@ -58,8 +61,8 @@ def aggregate_session_data(df):
         'price': 'sum',
         'converted': 'max',
         'revenue': 'max',
-        'country': 'first',               
-        'model_photography': 'first'      
+        'country': 'first',
+        'model_photography': 'first'
     }).reset_index()
     session_df.rename(columns={
         'page1_main_category': 'unique_categories',
@@ -68,43 +71,10 @@ def aggregate_session_data(df):
     }, inplace=True)
     return session_df
 
-
-
 train_session = aggregate_session_data(train_df)
 test_session = aggregate_session_data(test_df)
 
-
-
-#  Exploratory Data Analysis (EDA) 
-def perform_eda(df):
-    st.subheader("Exploratory Data Analysis")
-
-    # Time-based Analysis
-    if 'SESSION START' in df.columns:
-        df['hour'] = pd.to_datetime(df['SESSION START']).dt.hour
-        df['day_of_week'] = pd.to_datetime(df['SESSION START']).dt.day_name()
-
-    # Conversion distribution
-    plt.figure(figsize=(8,5))
-    sns.countplot(x='converted', data=df)
-    plt.title('Conversion Distribution')
-    st.pyplot(plt)
-
-    # Numerical feature distributions
-    df[['unique_categories', 'total_clicks', 'unique_colors', 'price', 'revenue']].hist(figsize=(12,8))
-    plt.tight_layout()
-    st.pyplot(plt)
-
-    # Correlation heatmap
-    plt.figure(figsize=(10,6))
-    sns.heatmap(df.corr(), annot=True, cmap='coolwarm')
-    st.pyplot(plt)
-   
-
-
-perform_eda(train_session)
-
-#  Feature Engineering 
+# Feature engineering transformer
 class FeatureEngineer(BaseEstimator, TransformerMixin):
     def fit(self, X, y=None):
         return self
@@ -118,11 +88,9 @@ class FeatureEngineer(BaseEstimator, TransformerMixin):
         X['exit_rate'] = X['total_clicks'] / (X['unique_categories'] + 1)
         return X
 
-
-#Preprocessing Pipeline
+# Preprocessing pipeline
 numeric_features = ['unique_categories', 'total_clicks', 'unique_colors', 'price', 'price_per_click', 'color_diversity']
-categorical_features = ['country','model_photography']
-
+categorical_features = ['country', 'model_photography']
 
 numeric_transformer = Pipeline([
     ('imputer', SimpleImputer(strategy='median')),
@@ -132,7 +100,7 @@ numeric_transformer = Pipeline([
 
 categorical_transformer = Pipeline([
     ('imputer', SimpleImputer(strategy='most_frequent')),
-    ('onehot', OneHotEncoder(handle_unknown='ignore'))
+    ('onehot', OneHotEncoder(handle_unknown='ignore', sparse_output=False))
 ])
 
 preprocessor = ColumnTransformer([
@@ -145,144 +113,31 @@ full_pipeline = Pipeline([
     ('preprocessor', preprocessor)
 ])
 
-#Balancing Techniques
-X = train_session.drop(['converted', 'revenue', 'session_id'], axis=1)
-y_class = train_session['converted']
-RandomUnderSampler()
-smote = SMOTE(random_state=42)
-class_weight='balanced'
-if len(y_class.unique()) > 1:
-    X_resampled, y_resampled = smote.fit_resample(X, y_class)
-else:
-    print("SMOTE skipped: Only one class present in y_class")
-    X_resampled, y_resampled = X, y_class  
+# === Fit the full_pipeline on training data to avoid 'Pipeline not fitted' error ===
+full_pipeline.fit(train_session.drop(columns=['session_id', 'converted', 'revenue']))
 
-
-print("X",X.columns.tolist())
-
-# Model Building & Evaluation 
-mlflow.set_experiment("Customer_Conversion_Analysis")
-
-# Classification
-with mlflow.start_run(run_name="Classification"):
-    class_pipeline = Pipeline([
-        ('preprocessing', full_pipeline),
-        ('classifier', XGBClassifier(use_label_encoder=False, eval_metric='logloss'))
-    ])
-   
-
-    class_pipeline.fit(X_resampled, y_resampled)
-    class_preds = class_pipeline.predict(X)
-
-    mlflow.log_metrics({
-        'accuracy': accuracy_score(y_class, class_preds),
-        'precision': precision_score(y_class, class_preds),
-        'recall': recall_score(y_class, class_preds),
-        'f1_score': f1_score(y_class, class_preds),
-        'roc_auc': roc_auc_score(y_class, class_preds)
-    })
-
-    mlflow.sklearn.log_model(class_pipeline, "classification_model")
-
-# Regression
-y_reg = train_session['revenue']
-with mlflow.start_run(run_name="Regression"):
-    reg_pipeline = Pipeline([
-        ('preprocessing', full_pipeline),
-        ('regressor', GradientBoostingRegressor())
-    ])
-
-    reg_pipeline.fit(X, y_reg)
-    reg_preds = reg_pipeline.predict(X)
-
-    mlflow.log_metrics({
-        'rmse': np.sqrt(mean_squared_error(y_reg, reg_preds)),
-        'mae': mean_absolute_error(y_reg, reg_preds),
-        'r2': r2_score(y_reg, reg_preds)
-    })
-
-    mlflow.sklearn.log_model(reg_pipeline, "regression_model")
-
-# Clustering
-# Clustering
-with mlflow.start_run(run_name="Clustering"):
-    preprocessed_data = full_pipeline.fit_transform(X)
-
-    # Convert sparse to dense if necessary
-    if sparse.issparse(preprocessed_data):
-        preprocessed_data_dense = preprocessed_data.toarray()
-    else:
-        preprocessed_data_dense = preprocessed_data
-
-    # Apply KMeans
-    kmeans = KMeans(n_clusters=3, random_state=42)
-    clusters = kmeans.fit_predict(preprocessed_data_dense)
-
-    # Calculate silhouette score
-    silhouette = silhouette_score(preprocessed_data_dense, clusters)
-
-    # Calculate davies_bouldin_score (Now using dense data)
-    davies_bouldin = davies_bouldin_score(preprocessed_data_dense, clusters)
-
-    # Log metrics
-    mlflow.log_metrics({
-        'silhouette': silhouette,
-        'davies_bouldin': davies_bouldin
-    })
-
-    # Save the KMeans model
-    mlflow.sklearn.log_model(kmeans, "clustering_model")
-
-
-
-# Model Saving
-pickle.dump(class_pipeline, open('best_classifier.pkl', 'wb'))
-pickle.dump(reg_pipeline, open('best_regressor.pkl', 'wb'))
-pickle.dump(kmeans, open('best_clusterer.pkl', 'wb'))
-
-#Streamlit Application
+# Streamlit Interface
 st.title('Customer Conversion Analysis')
 
 uploaded_file = st.file_uploader("Upload CSV File", type=['csv'])
-manual_input = st.checkbox("Or enter data manually", key='checked')
-#st.write("manual_input",manual_input)
+manual_input = st.checkbox("Or enter data manually")
 input_df = pd.DataFrame()
-# Initialize session state for checkbox
-if 'checked' not in st.session_state:
-    st.session_state.checked = False
-
-# Function to reset checkbox
-def reset_checkbox():
-    st.session_state.checked = False
-    manual_input =False
 
 if uploaded_file is not None:
-    #reset_checkbox()
-    # Read the first few bytes to detect the separator
     sample = uploaded_file.read(1024).decode('utf-8')
-    uploaded_file.seek(0)  # Reset pointer after reading
-
-    # Determine separator based on sample content
+    uploaded_file.seek(0)
     sep = ';' if ';' in sample else ','
-
-    # Read CSV with the appropriate separator
     input_df = pd.read_csv(uploaded_file, sep=sep, skipinitialspace=True)
     columns_to_rename = {
-    'session ID': 'session_id',
-    'page 1 (main category)': 'page1_main_category',
-    'page 2 (clothing model)': 'page2_clothing_model',
-    'model photography':'model_photography',
-    'price 2':'price_2'
+        'session ID': 'session_id',
+        'page 1 (main category)': 'page1_main_category',
+        'page 2 (clothing model)': 'page2_clothing_model',
+        'model photography': 'model_photography',
+        'price 2': 'price_2'
     }
-
-    for col in columns_to_rename:
-        if col in input_df.columns:
-            input_df.rename(columns={col: columns_to_rename[col]}, inplace=True)
-        else:
-            print(f"Column '{col}' does not exist.")
-    #input_df = input_df[0].str.split(';', expand=True)
+    input_df.rename(columns={k: v for k, v in columns_to_rename.items() if k in input_df.columns}, inplace=True)
     st.write(input_df)
-    #input_df = pd.read_csv(uploaded_file)
+
 if manual_input:
     st.subheader("Manual Input")
     with st.form("manual_input_form"):
@@ -321,48 +176,43 @@ if manual_input:
         })
         
         input_df = manual_data
-        
 
 if not input_df.empty:
-    
-    processed_df = aggregate_session_data(create_targets(input_df))
-
-    # Load models
-    class_model = pickle.load(open('best_classifier.pkl', 'rb'))
-    reg_model = pickle.load(open('best_regressor.pkl', 'rb'))
-    cluster_model = pickle.load(open('best_clusterer.pkl', 'rb'))
-    
     try:
-        # Predictions
+        processed_df = aggregate_session_data(create_targets(input_df))
+        class_model = pickle.load(open('best_classifier.pkl', 'rb'))
+        reg_model = pickle.load(open('best_regressor.pkl', 'rb'))
+        cluster_model = pickle.load(open('best_clusterer.pkl', 'rb'))
+
         conv_pred = class_model.predict(processed_df.drop(['session_id'], axis=1))
         revenue_pred = reg_model.predict(processed_df.drop(['session_id'], axis=1))
         clusters = cluster_model.predict(full_pipeline.transform(processed_df.drop(['session_id'], axis=1)))
 
-        # Display results
         processed_df['Conversion Prediction'] = conv_pred
         processed_df['Revenue Estimate'] = revenue_pred
         processed_df['Customer Segment'] = clusters
 
         st.subheader('Predictions')
         st.dataframe(processed_df[['session_id', 'Conversion Prediction', 'Revenue Estimate', 'Customer Segment']])
+
+        # Visualizations
+        st.subheader('Customer Segments Distribution')
+        fig, ax = plt.subplots()
+        sns.countplot(x='Customer Segment', data=processed_df)
+        st.pyplot(fig)
+
+        st.subheader('Revenue Distribution')
+        fig, ax = plt.subplots()
+        sns.histplot(processed_df['Revenue Estimate'])
+        st.pyplot(fig)
+
+        st.subheader("Conversion Rate by Customer Segment")
+        fig, ax = plt.subplots()
+        processed_df['Customer Segment'].value_counts().plot.pie(autopct='%1.1f%%', ax=ax)
+        st.pyplot(fig)
+
     except Exception as e:
+        logging.error(f"Prediction Error: {e}")
         st.error(f"Prediction Error: {e}")
-
-    # Visualizations
-    st.subheader('Customer Segments Distribution')
-    fig, ax = plt.subplots()
-    sns.countplot(x='Customer Segment', data=processed_df)
-    st.pyplot(fig)
-
-    st.subheader('Revenue Distribution')
-    fig, ax = plt.subplots()
-    sns.histplot(processed_df['Revenue Estimate'])
-    st.pyplot(fig)
-
-    st.subheader("Conversion Rate by Customer Segment")
-    fig, ax = plt.subplots()
-    processed_df['Customer Segment'].value_counts().plot.pie(autopct='%1.1f%%', ax=ax)
-    st.pyplot(fig)
-
-else :
+else:
     st.warning("Please upload a CSV or enter data manually.")
